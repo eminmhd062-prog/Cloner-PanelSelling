@@ -683,6 +683,23 @@ def prepare_clone(template: Path, workdir: Path, token: str, owner_id: int, bot_
     source = re.sub(r'(?m)^BOT_TOKEN\s*=\s*.*$', 'BOT_TOKEN = os.getenv("BOT_TOKEN", "")', source, count=1)
     source = re.sub(r'(?m)^ADMIN_ID\s*=\s*.*$', 'ADMIN_ID = int(os.getenv("CLONE_ADMIN_ID", "0"))', source, count=1)
     source = re.sub(r'(?m)^BOT_USERNAME\s*=\s*.*$', 'BOT_USERNAME = os.getenv("BOT_USERNAME", "")', source, count=1)
+    # Publish the Telegram command menu automatically for every launched clone.
+    if 'BotCommand' not in source:
+        source = source.replace(
+            'InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, Dice, BufferedInputFile',
+            'InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, Dice, BufferedInputFile, BotCommand',
+            1
+        )
+    if 'await bot.set_my_commands(' not in source:
+        source = source.replace(
+            '        await dp.start_polling(bot)',
+            '        await bot.set_my_commands([\n'
+            '            BotCommand(command="start", description="Start the bot"),\n'
+            '            BotCommand(command="admin", description="Open admin panel"),\n'
+            '        ])\n'
+            '        await dp.start_polling(bot)',
+            1
+        )
     if 'import os' not in source:
         source = 'import os\n' + source
     # Replace the exact store title everywhere in the source. The Telegram display name is used as requested.
@@ -711,14 +728,14 @@ async def _show_start_progress(message, log_path, phase='STARTING'):
             lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()[-7:]
         except OSError:
             lines = []
-        console = "\\n".join(lines).strip() or "Waiting for startup output..."
+        console = "\n".join(lines).strip() or "Waiting for startup output..."
         if len(console) > 1800:
             console = console[-1800:]
         text = (
-            f"⏳ <b>{phase}...</b>\\n"
-            "━━━━━━━━━━━━━━━━━━━━\\n"
-            "The bot is being checked. Please wait.\\n\\n"
-            f"<b>📟 CONSOLE</b>\\n<pre>{escape(console)}</pre>"
+            f"⏳ <b>{phase}...</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "The bot is being checked. Please wait.\n\n"
+            f"<b>📟 CONSOLE</b>\n<pre>{escape(console)}</pre>"
         )
         await message.edit_text(text)
     except Exception:
@@ -726,8 +743,35 @@ async def _show_start_progress(message, log_path, phase='STARTING'):
         pass
 
 
+def ensure_clone_command_menu(main_path: Path):
+    """Ensure both newly-created and already-existing clones publish their Telegram command menu."""
+    source = main_path.read_text(encoding='utf-8')
+    changed = False
+    if 'BotCommand' not in source:
+        old_import = 'InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, Dice, BufferedInputFile'
+        new_import = old_import + ', BotCommand'
+        if old_import in source:
+            source = source.replace(old_import, new_import, 1)
+            changed = True
+    if 'await bot.set_my_commands(' not in source:
+        old_start = '        await dp.start_polling(bot)'
+        new_start = (
+            '        await bot.set_my_commands([\n'
+            '            BotCommand(command="start", description="Start the bot"),\n'
+            '            BotCommand(command="admin", description="Open admin panel"),\n'
+            '        ])\n'
+            '        await dp.start_polling(bot)'
+        )
+        if old_start in source:
+            source = source.replace(old_start, new_start, 1)
+            changed = True
+    if changed:
+        main_path.write_text(source, encoding='utf-8')
+
+
 async def launch_clone(row, progress_message=None):
     workdir = Path(row['workdir'])
+    ensure_clone_command_menu(workdir / 'main.py')
     env_path = workdir / '.env'
     values = {}
     for line in env_path.read_text(encoding='utf-8').splitlines():
@@ -741,7 +785,7 @@ async def launch_clone(row, progress_message=None):
 
     # Start a fresh console section for this launch attempt.
     with open(log_path, 'a', encoding='utf-8') as log_handle:
-        log_handle.write(f"\\n--- START ATTEMPT {datetime.utcnow().isoformat()} ---\\n")
+        log_handle.write(f"\n--- START ATTEMPT {datetime.utcnow().isoformat()} ---\n")
         log_handle.flush()
         proc = await asyncio.create_subprocess_exec(
             sys.executable, 'main.py', cwd=workdir, env=env,
@@ -768,11 +812,11 @@ async def launch_clone(row, progress_message=None):
         update_status(row['id'], 'stopped', None)
         try:
             log_text = log_path.read_text(encoding='utf-8', errors='replace')
-            details = '\\n'.join(log_text.strip().splitlines()[-12:])
+            details = '\n'.join(log_text.strip().splitlines()[-12:])
         except OSError:
             details = ''
         reason = details[-1200:] if details else 'The cloned bot process exited during startup.'
-        raise RuntimeError(f'Clone startup failed. The bot is not running.\\n{reason}')
+        raise RuntimeError(f'Clone startup failed. The bot is not running.\n{reason}')
 
     update_status(row['id'], 'running', proc.pid)
     return proc.pid
@@ -889,7 +933,7 @@ async def receive_token(message: Message, state: FSMContext):
                   (message.from_user.id, me.id, me.username or '', bot_name, str(workdir), 'stopped', datetime.utcnow().isoformat()))
         clone_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
     row = get_clone(clone_id)
-    progress_message = await message.answer('⏳ <b>STARTING...</b>\\nChecking your bot and preparing the console...')
+    progress_message = await message.answer('⏳ <b>STARTING...</b>\nChecking your bot and preparing the console...')
     try:
         pid = await launch_clone(row, progress_message=progress_message)
         result = (
@@ -986,14 +1030,14 @@ async def process_action(call: CallbackQuery):
         try:
             if action == 'stop':
                 await call.message.edit_text(
-                    f"<b>⏹ STOPPING {escape(row['bot_name'] or 'BOT')}...</b>\\nWaiting for the process to close."
+                    f"<b>⏹ STOPPING {escape(row['bot_name'] or 'BOT')}...</b>\nWaiting for the process to close."
                 )
                 await stop_clone(row)
             elif action == 'start':
-                await call.message.edit_text('⏳ <b>STARTING...</b>\\nChecking the bot and reading console output...')
+                await call.message.edit_text('⏳ <b>STARTING...</b>\nChecking the bot and reading console output...')
                 await start_clone(row, progress_message=call.message)
             else:
-                await call.message.edit_text('🔄 <b>RESTARTING...</b>\\nStopping the old process and starting a fresh one...')
+                await call.message.edit_text('🔄 <b>RESTARTING...</b>\nStopping the old process and starting a fresh one...')
                 await stop_clone(row)
                 await start_clone(get_clone(clone_id), progress_message=call.message)
 
@@ -1001,7 +1045,7 @@ async def process_action(call: CallbackQuery):
             status = 'running' if process_alive(fresh['pid']) else 'stopped'
             update_status(clone_id, status, fresh['pid'] if status == 'running' else None)
             await call.message.edit_text(
-                f"<b>🤖 {escape(fresh['bot_name'] or 'My Bot')}</b>\\n"
+                f"<b>🤖 {escape(fresh['bot_name'] or 'My Bot')}</b>\n"
                 f"Status: {'🟢 Running' if status == 'running' else '🔴 Stopped'}",
                 reply_markup=clone_actions_kb(clone_id, status)
             )
@@ -1010,7 +1054,7 @@ async def process_action(call: CallbackQuery):
             update_status(clone_id, 'stopped', None)
             try:
                 await call.message.edit_text(
-                    f"<b>❌ BOT ACTION FAILED</b>\\n<code>{escape(str(e)[-2500:])}</code>",
+                    f"<b>❌ BOT ACTION FAILED</b>\n<code>{escape(str(e)[-2500:])}</code>",
                     reply_markup=clone_actions_kb(clone_id, 'stopped')
                 )
             except Exception:
@@ -1135,8 +1179,8 @@ async def begin_broadcast(call: CallbackQuery, state: FSMContext):
         return await call.answer('Owner only.', show_alert=True)
     await state.set_state(Flow.waiting_broadcast)
     await call.message.edit_text(
-        '<b>📢 BROADCAST MESSAGE</b>\\n\\n'
-        'Send the message you want to broadcast. Text formatting, bold, italic, links, photos and captions are preserved.\\n'
+        '<b>📢 BROADCAST MESSAGE</b>\n\n'
+        'Send the message you want to broadcast. Text formatting, bold, italic, links, photos and captions are preserved.\n'
         'Send /cancel to cancel.',
         reply_markup=back_menu_kb()
     )
@@ -1154,7 +1198,7 @@ async def send_broadcast(message: Message, state: FSMContext):
     with db() as c:
         recipients = [r['user_id'] for r in c.execute('SELECT user_id FROM users').fetchall()]
     await state.clear()
-    status = await message.answer(f'📤 <b>Broadcast started...</b>\\nRecipients: {len(recipients)}')
+    status = await message.answer(f'📤 <b>Broadcast started...</b>\nRecipients: {len(recipients)}')
     sent = failed = 0
     for uid in recipients:
         try:
@@ -1169,17 +1213,17 @@ async def send_broadcast(message: Message, state: FSMContext):
         if (sent + failed) % 20 == 0:
             try:
                 await status.edit_text(
-                    f'📤 <b>BROADCAST IN PROGRESS</b>\\n'
-                    f'Processed: {sent + failed}/{len(recipients)}\\n'
+                    f'📤 <b>BROADCAST IN PROGRESS</b>\n'
+                    f'Processed: {sent + failed}/{len(recipients)}\n'
                     f'Sent: {sent} | Failed: {failed}'
                 )
             except Exception:
                 pass
         await asyncio.sleep(0.04)
     await status.edit_text(
-        f'✅ <b>BROADCAST COMPLETED</b>\\n'
-        f'Total users: {len(recipients)}\\n'
-        f'Success: {sent}\\nFailed: {failed}',
+        f'✅ <b>BROADCAST COMPLETED</b>\n'
+        f'Total users: {len(recipients)}\n'
+        f'Success: {sent}\nFailed: {failed}',
         reply_markup=owner_kb()
     )
 
