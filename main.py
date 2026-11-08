@@ -513,6 +513,7 @@ class Flow(StatesGroup):
     waiting_token = State()
     waiting_upload = State()
     waiting_limit = State()
+    waiting_broadcast = State()
 
 class CentralAdminFlow(StatesGroup):
     add_category = State()
@@ -594,6 +595,7 @@ def owner_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📊 Statistics', callback_data='stats', style='primary')],
         [InlineKeyboardButton(text='📤 Change Cloning File', callback_data='upload_template', style='primary')],
+        [InlineKeyboardButton(text='📢 Broadcast Message', callback_data='broadcast', style='primary')],
         [InlineKeyboardButton(text='🔢 Set Clone Limit', callback_data='set_limit', style='success')],
         [InlineKeyboardButton(text='🤖 Manage All Bots', callback_data='allbots', style='success')],
         [InlineKeyboardButton(text='⬅️ Back to Menu', callback_data='home', style='danger')],
@@ -646,7 +648,15 @@ def process_alive(pid):
     if not pid:
         return False
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        # Linux may report a terminated child as existing while it is a zombie.
+        stat_path = Path(f'/proc/{pid}/stat')
+        if stat_path.exists():
+            stat_text = stat_path.read_text(encoding='utf-8', errors='replace')
+            state = stat_text[stat_text.rfind(')') + 2:stat_text.rfind(')') + 3]
+            if state == 'Z':
+                return False
+        os.kill(pid, 0)
         return True
     except (OSError, ValueError, TypeError):
         return False
@@ -690,7 +700,33 @@ def prepare_clone(template: Path, workdir: Path, token: str, owner_id: int, bot_
     return target
 
 
-async def launch_clone(row):
+_clone_locks = {}
+
+
+async def _show_start_progress(message, log_path, phase='STARTING'):
+    if message is None:
+        return
+    try:
+        try:
+            lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()[-7:]
+        except OSError:
+            lines = []
+        console = "\\n".join(lines).strip() or "Waiting for startup output..."
+        if len(console) > 1800:
+            console = console[-1800:]
+        text = (
+            f"⏳ <b>{phase}...</b>\\n"
+            "━━━━━━━━━━━━━━━━━━━━\\n"
+            "The bot is being checked. Please wait.\\n\\n"
+            f"<b>📟 CONSOLE</b>\\n<pre>{escape(console)}</pre>"
+        )
+        await message.edit_text(text)
+    except Exception:
+        # A deleted/expired status message must not interrupt bot startup.
+        pass
+
+
+async def launch_clone(row, progress_message=None):
     workdir = Path(row['workdir'])
     env_path = workdir / '.env'
     values = {}
@@ -703,22 +739,23 @@ async def launch_clone(row):
     env['PYTHONUNBUFFERED'] = '1'
     log_path = workdir / 'runtime.log'
 
-    # Do not mark a clone as running merely because the OS created a process.
-    # Keep checking during startup; a bot that exits with an import/config/db
-    # error must never be reported as successfully hosted.
+    # Start a fresh console section for this launch attempt.
     with open(log_path, 'a', encoding='utf-8') as log_handle:
+        log_handle.write(f"\\n--- START ATTEMPT {datetime.utcnow().isoformat()} ---\\n")
+        log_handle.flush()
         proc = await asyncio.create_subprocess_exec(
             sys.executable, 'main.py', cwd=workdir, env=env,
             stdout=log_handle, stderr=log_handle
         )
 
     update_status(row['id'], 'starting', proc.pid)
-    startup_window = 8.0
-    check_interval = 0.5
+    startup_window = 12.0
+    check_interval = 1.0
     elapsed = 0.0
     while elapsed < startup_window:
-        if proc.returncode is not None:
+        if proc.returncode is not None or not process_alive(proc.pid):
             break
+        await _show_start_progress(progress_message, log_path, 'STARTING')
         await asyncio.sleep(check_interval)
         elapsed += check_interval
         if proc.returncode is None:
@@ -746,19 +783,35 @@ async def stop_clone(row):
     if process_alive(pid):
         try:
             os.kill(int(pid), 15)
-        except OSError:
+        except ProcessLookupError:
             pass
+        except OSError as exc:
+            raise RuntimeError(f'Could not stop bot process: {exc}')
+        # Wait for a graceful exit before allowing a restart.
+        for _ in range(30):
+            if not process_alive(pid):
+                break
+            await asyncio.sleep(0.2)
+        if process_alive(pid):
+            try:
+                os.kill(int(pid), 9)
+            except OSError:
+                pass
+            for _ in range(10):
+                if not process_alive(pid):
+                    break
+                await asyncio.sleep(0.1)
     update_status(row['id'], 'stopped', None)
 
 
-async def start_clone(row):
+async def start_clone(row, progress_message=None):
     if process_alive(row['pid']):
         update_status(row['id'], 'running', row['pid'])
         return row['pid']
     template = load_template()
     if not template:
         raise RuntimeError('The built-in Panel Selling Bot template is missing.')
-    return await launch_clone(row)
+    return await launch_clone(row, progress_message=progress_message)
 
 
 @dp.message(CommandStart())
@@ -836,8 +889,9 @@ async def receive_token(message: Message, state: FSMContext):
                   (message.from_user.id, me.id, me.username or '', bot_name, str(workdir), 'stopped', datetime.utcnow().isoformat()))
         clone_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
     row = get_clone(clone_id)
+    progress_message = await message.answer('⏳ <b>STARTING...</b>\\nChecking your bot and preparing the console...')
     try:
-        pid = await launch_clone(row)
+        pid = await launch_clone(row, progress_message=progress_message)
         result = (
             f'🎉 <b>HOSTING SUCCESSFULLY COMPLETED!</b>\n'
             f'━━━━━━━━━━━━━━━━━━━━━━\n\n'
@@ -885,7 +939,10 @@ async def receive_token(message: Message, state: FSMContext):
         f'<b>Result:</b> {escape(result.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))}'
     )
     await notify_owner(notification)
-    await message.answer(result, reply_markup=home_kb(is_owner(message.from_user.id)))
+    try:
+        await progress_message.edit_text(result, reply_markup=home_kb(is_owner(message.from_user.id)))
+    except Exception:
+        await message.answer(result, reply_markup=home_kb(is_owner(message.from_user.id)))
 
 
 @dp.callback_query(F.data == 'mybots')
@@ -911,27 +968,53 @@ async def select_bot(call: CallbackQuery):
 @dp.callback_query(F.data.startswith(('start:', 'stop:', 'restart:')))
 async def process_action(call: CallbackQuery):
     action, raw_id = call.data.split(':', 1)
-    clone_id = int(raw_id)
+    try:
+        clone_id = int(raw_id)
+    except ValueError:
+        return await call.answer('Invalid bot ID.', show_alert=True)
     row = get_clone(clone_id)
     if not row or (row['owner_id'] != call.from_user.id and not is_owner(call.from_user.id)):
         await call.answer('Not authorized.', show_alert=True)
         return
-    try:
-        if action == 'stop':
-            await stop_clone(row)
-        elif action == 'start':
-            await start_clone(row)
-        else:
-            await stop_clone(row)
-            await asyncio.sleep(1)
-            await start_clone(get_clone(clone_id))
-        fresh = get_clone(clone_id)
-        status = 'running' if process_alive(fresh['pid']) else 'stopped'
-        update_status(clone_id, status, fresh['pid'] if status == 'running' else None)
-        await call.message.edit_text(f"<b>🤖 {fresh['bot_name']}</b>\nStatus: {'🟢 Running' if status == 'running' else '🔴 Stopped'}", reply_markup=clone_actions_kb(clone_id, status))
-        await call.answer('Done.')
-    except Exception as e:
-        await call.answer(str(e)[:180], show_alert=True)
+
+    lock = _clone_locks.setdefault(clone_id, asyncio.Lock())
+    if lock.locked():
+        return await call.answer('Another action is already running for this bot.', show_alert=True)
+
+    await call.answer('Please wait...')
+    async with lock:
+        try:
+            if action == 'stop':
+                await call.message.edit_text(
+                    f"<b>⏹ STOPPING {escape(row['bot_name'] or 'BOT')}...</b>\\nWaiting for the process to close."
+                )
+                await stop_clone(row)
+            elif action == 'start':
+                await call.message.edit_text('⏳ <b>STARTING...</b>\\nChecking the bot and reading console output...')
+                await start_clone(row, progress_message=call.message)
+            else:
+                await call.message.edit_text('🔄 <b>RESTARTING...</b>\\nStopping the old process and starting a fresh one...')
+                await stop_clone(row)
+                await start_clone(get_clone(clone_id), progress_message=call.message)
+
+            fresh = get_clone(clone_id)
+            status = 'running' if process_alive(fresh['pid']) else 'stopped'
+            update_status(clone_id, status, fresh['pid'] if status == 'running' else None)
+            await call.message.edit_text(
+                f"<b>🤖 {escape(fresh['bot_name'] or 'My Bot')}</b>\\n"
+                f"Status: {'🟢 Running' if status == 'running' else '🔴 Stopped'}",
+                reply_markup=clone_actions_kb(clone_id, status)
+            )
+        except Exception as e:
+            fresh = get_clone(clone_id)
+            update_status(clone_id, 'stopped', None)
+            try:
+                await call.message.edit_text(
+                    f"<b>❌ BOT ACTION FAILED</b>\\n<code>{escape(str(e)[-2500:])}</code>",
+                    reply_markup=clone_actions_kb(clone_id, 'stopped')
+                )
+            except Exception:
+                pass
 
 
 @dp.callback_query(F.data.startswith('adminpanel:'))
@@ -1044,6 +1127,61 @@ async def save_limit(message: Message, state: FSMContext):
     set_setting('clone_limit', value)
     await state.clear()
     await message.answer(f'✅ Clone limit updated to {value}.', reply_markup=owner_kb())
+
+
+@dp.callback_query(F.data == 'broadcast')
+async def begin_broadcast(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    await state.set_state(Flow.waiting_broadcast)
+    await call.message.edit_text(
+        '<b>📢 BROADCAST MESSAGE</b>\\n\\n'
+        'Send the message you want to broadcast. Text formatting, bold, italic, links, photos and captions are preserved.\\n'
+        'Send /cancel to cancel.',
+        reply_markup=back_menu_kb()
+    )
+    await call.answer()
+
+
+@dp.message(Flow.waiting_broadcast)
+async def send_broadcast(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if (message.text or '').strip().lower() == '/cancel':
+        await state.clear()
+        return await message.answer('Broadcast cancelled.', reply_markup=owner_kb())
+
+    with db() as c:
+        recipients = [r['user_id'] for r in c.execute('SELECT user_id FROM users').fetchall()]
+    await state.clear()
+    status = await message.answer(f'📤 <b>Broadcast started...</b>\\nRecipients: {len(recipients)}')
+    sent = failed = 0
+    for uid in recipients:
+        try:
+            await bot.copy_message(
+                chat_id=int(uid),
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        if (sent + failed) % 20 == 0:
+            try:
+                await status.edit_text(
+                    f'📤 <b>BROADCAST IN PROGRESS</b>\\n'
+                    f'Processed: {sent + failed}/{len(recipients)}\\n'
+                    f'Sent: {sent} | Failed: {failed}'
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.04)
+    await status.edit_text(
+        f'✅ <b>BROADCAST COMPLETED</b>\\n'
+        f'Total users: {len(recipients)}\\n'
+        f'Success: {sent}\\nFailed: {failed}',
+        reply_markup=owner_kb()
+    )
 
 
 @dp.callback_query(F.data == 'allbots')
