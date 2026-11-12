@@ -584,6 +584,7 @@ class Flow(StatesGroup):
     waiting_upload = State()
     waiting_clone_file = State()
     waiting_limit = State()
+    broadcast_message = State()
 
 class CentralAdminFlow(StatesGroup):
     add_category = State()
@@ -682,6 +683,7 @@ def home_kb(owner=False):
 def owner_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📊 Statistics', callback_data='stats', style='primary')],
+        [InlineKeyboardButton(text='📢 Broadcast Users', callback_data='owner_broadcast', style='success')],
         [InlineKeyboardButton(text='📤 Change Cloning File', callback_data='upload_template', style='primary')],
         [InlineKeyboardButton(text='🔢 Set Clone Limit', callback_data='set_limit', style='success')],
         [InlineKeyboardButton(text='🤖 Manage All Bots', callback_data='allbots', style='success')],
@@ -1311,6 +1313,125 @@ async def owner_panel(call: CallbackQuery):
         return
     await call.message.edit_text('<b>👑 OWNER ADMIN PANEL</b>', reply_markup=owner_kb())
     await call.answer()
+
+
+@dp.callback_query(F.data == 'owner_broadcast')
+async def owner_broadcast_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    with db() as c:
+        total = c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']
+    if total <= 0:
+        return await call.answer('No registered users are available for broadcast.', show_alert=True)
+    await state.set_state(Flow.broadcast_message)
+    await call.message.edit_text(
+        '<b>📢 MAIN BOT BROADCAST</b>\n\n'
+        f'<b>Registered users:</b> {total}\n\n'
+        'Send the message or media you want to broadcast now.\n'
+        'Telegram formatting, links, photos, videos, documents and captions are copied as sent.\n\n'
+        '<i>Send /cancel to stop.</i>',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='❌ Cancel Broadcast', callback_data='owner_broadcast_cancel', style='danger')],
+            [InlineKeyboardButton(text='⬅️ Owner Panel', callback_data='owner_panel', style='primary')],
+        ]),
+        parse_mode='HTML',
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == 'owner_broadcast_cancel')
+async def owner_broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    await state.clear()
+    await call.message.edit_text('<b>👑 OWNER ADMIN PANEL</b>', reply_markup=owner_kb(), parse_mode='HTML')
+    await call.answer('Broadcast cancelled.')
+
+
+@dp.message(Flow.broadcast_message)
+async def owner_broadcast_send(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+
+    if (message.text or '').strip().lower() == '/cancel':
+        await state.clear()
+        return await message.answer('<b>Broadcast cancelled.</b>', reply_markup=owner_kb(), parse_mode='HTML')
+
+    with db() as c:
+        recipients = [int(row['user_id']) for row in c.execute(
+            'SELECT user_id FROM users ORDER BY joined_at ASC'
+        ).fetchall()]
+
+    if not recipients:
+        await state.clear()
+        return await message.answer('<b>No registered users found.</b>', reply_markup=owner_kb(), parse_mode='HTML')
+
+    progress = await message.answer(
+        f'<b>📢 Main Bot Broadcast Started</b>\n'
+        f'Target users: <b>{len(recipients)}</b>\n'
+        'Please wait while delivery is in progress...',
+        parse_mode='HTML',
+    )
+    sent = 0
+    failed = 0
+
+    for index, user_id in enumerate(recipients, start=1):
+        delivered = False
+        for attempt in range(3):
+            try:
+                await message.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    reply_markup=message.reply_markup,
+                )
+                delivered = True
+                break
+            except Exception as exc:
+                retry_after = getattr(exc, 'retry_after', None)
+                if retry_after and attempt < 2:
+                    await asyncio.sleep(float(retry_after) + 0.5)
+                    continue
+                log.warning('Main bot broadcast failed for user %s: %s', user_id, exc)
+                break
+
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+
+        # Stay below Telegram's usual per-chat broadcast throughput.
+        await asyncio.sleep(0.05)
+
+        if index % 50 == 0:
+            try:
+                await progress.edit_text(
+                    '<b>📢 Main Bot Broadcast In Progress</b>\n'
+                    f'Processed: <b>{index}/{len(recipients)}</b>\n'
+                    f'Sent: <b>{sent}</b> · Failed: <b>{failed}</b>',
+                    parse_mode='HTML',
+                )
+            except Exception:
+                pass
+
+    await state.clear()
+    try:
+        await progress.edit_text(
+            '<b>✅ MAIN BOT BROADCAST COMPLETED</b>\n\n'
+            f'Total users: <b>{len(recipients)}</b>\n'
+            f'Successfully sent: <b>{sent}</b>\n'
+            f'Failed / blocked: <b>{failed}</b>',
+            reply_markup=owner_kb(),
+            parse_mode='HTML',
+        )
+    except Exception:
+        await message.answer(
+            '<b>✅ MAIN BOT BROADCAST COMPLETED</b>\n'
+            f'Total: {len(recipients)} · Sent: {sent} · Failed: {failed}',
+            reply_markup=owner_kb(),
+            parse_mode='HTML',
+        )
 
 
 @dp.callback_query(F.data == 'stats')
