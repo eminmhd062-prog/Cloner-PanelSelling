@@ -704,6 +704,7 @@ def clone_actions_kb(clone_id, status, can_change_file=False):
     rows = [
         [start_stop],
         [InlineKeyboardButton(text='🔄 Restart Bot', callback_data=f'restart:{clone_id}', style='primary')],
+        [InlineKeyboardButton(text='🖥 Live Console', callback_data=f'console:{clone_id}', style='primary')],
     ]
     if can_change_file:
         rows.append([InlineKeyboardButton(text='📤 Change Bot File', callback_data=f'changefile:{clone_id}', style='primary')])
@@ -838,6 +839,75 @@ async def sync_clone_commands(row):
         log.exception('Could not publish Telegram command menu for clone %s', row['id'])
 
 
+# Live console refreshers: one updater per Telegram message.
+_console_watch_tasks = {}
+
+
+def render_clone_console(row, tail_lines=28):
+    workdir = Path(row['workdir'])
+    log_path = workdir / 'runtime.log'
+    try:
+        lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()[-tail_lines:]
+        body = '\n'.join(lines).strip() or 'Waiting for process output...'
+    except OSError:
+        body = 'Console log has not been created yet.'
+    # Telegram message text has a 4096 character limit. Keep a safe margin.
+    body = body[-2800:]
+    status = row['status'].upper()
+    if status == 'RUNNING' and not process_alive(row['pid']):
+        status = 'PROCESS EXITED'
+    return (
+        f'<b>🖥 LIVE CONSOLE · {escape(str(row["bot_name"] or "Bot"))}</b>\n'
+        f'<b>Clone ID:</b> <code>{row["id"]}</code>  |  <b>Status:</b> <b>{escape(status)}</b>\n'
+        '<code>' + escape(body) + '</code>\n\n'
+        '<i>Auto-refresh: every 1 second</i>'
+    )
+
+
+async def _console_watch(bot_obj, chat_id, message_id, clone_id, keep_seconds=900):
+    key = (chat_id, message_id)
+    started = asyncio.get_running_loop().time()
+    last_text = None
+    try:
+        while asyncio.get_running_loop().time() - started < keep_seconds:
+            row = get_clone(clone_id)
+            if not row:
+                text_value = '<b>Console stopped: this bot was removed.</b>'
+                if text_value != last_text:
+                    try: await bot_obj.edit_message_text(text_value, chat_id=chat_id, message_id=message_id)
+                    except Exception: pass
+                break
+            text_value = render_clone_console(row)
+            if text_value != last_text:
+                try:
+                    await bot_obj.edit_message_text(text_value, chat_id=chat_id, message_id=message_id)
+                    last_text = text_value
+                except Exception as exc:
+                    # Ignore unchanged-message / transient Telegram errors; stop only if message is gone.
+                    err = str(exc).lower()
+                    if 'message to edit not found' in err or 'message_id_invalid' in err:
+                        break
+            # During first-time clone setup, continue until it reaches a terminal status.
+            if row['status'] in ('running', 'stopped') and not process_alive(row['pid']):
+                if row['status'] == 'stopped':
+                    # Keep a short final view after startup failure/stop, then finish.
+                    await asyncio.sleep(3)
+                    break
+            await asyncio.sleep(1)
+    finally:
+        _console_watch_tasks.pop(key, None)
+
+
+async def start_console_watch(chat_id, message_id, clone_id, keep_seconds=900):
+    key = (chat_id, message_id)
+    old = _console_watch_tasks.get(key)
+    if old and not old.done():
+        old.cancel()
+    task = asyncio.create_task(_console_watch(bot, chat_id, message_id, clone_id, keep_seconds))
+    _console_watch_tasks[key] = task
+    return task
+
+
 async def launch_clone(row):
     workdir = Path(row['workdir'])
     env_path = workdir / '.env'
@@ -855,6 +925,8 @@ async def launch_clone(row):
     # Keep checking during startup; a bot that exits with an import/config/db
     # error must never be reported as successfully hosted.
     with open(log_path, 'a', encoding='utf-8') as log_handle:
+        log_handle.write(f'\n--- Clone launch requested at {datetime.utcnow().isoformat()} UTC ---\n')
+        log_handle.flush()
         proc = await asyncio.create_subprocess_exec(
             sys.executable, 'main.py', cwd=workdir, env=env,
             stdout=log_handle, stderr=log_handle
@@ -986,9 +1058,16 @@ async def receive_token(message: Message, state: FSMContext):
     prepare_clone(template, workdir, token, message.from_user.id, bot_name, me.username or '')
     with db() as c:
         c.execute('INSERT INTO clones(owner_id,bot_id,bot_username,bot_name,workdir,status,created_at) VALUES(?,?,?,?,?,?,?)',
-                  (message.from_user.id, me.id, me.username or '', bot_name, str(workdir), 'stopped', datetime.utcnow().isoformat()))
+                  (message.from_user.id, me.id, me.username or '', bot_name, str(workdir), 'starting', datetime.utcnow().isoformat()))
         clone_id = c.execute('SELECT last_insert_rowid()').fetchone()[0]
     row = get_clone(clone_id)
+    console_message = await message.answer(
+        f'<b>🖥 LIVE CONSOLE · {escape(bot_name)}</b>\n'
+        '<b>Status:</b> <b>CLONING</b>\n'
+        '<code>Validating token...\nPreparing bot files...\nStarting process...</code>\n\n'
+        '<i>Console refreshes every 1 second.</i>'
+    )
+    await start_console_watch(console_message.chat.id, console_message.message_id, clone_id, keep_seconds=180)
     try:
         pid = await launch_clone(row)
         result = (
@@ -1059,6 +1138,18 @@ async def select_bot(call: CallbackQuery):
     update_status(clone_id, status, row['pid'] if status == 'running' else None)
     await call.message.edit_text(f"<b>🤖 {row['bot_name']}</b>\nUsername: @{row['bot_username']}\nStatus: {'🟢 Running' if status == 'running' else '🔴 Stopped'}", reply_markup=clone_actions_kb(clone_id, status, can_change_file=is_owner(call.from_user.id)))
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith('console:'))
+async def open_clone_console(call: CallbackQuery):
+    clone_id = int(call.data.split(':', 1)[1])
+    row = get_clone(clone_id)
+    if not row or (row['owner_id'] != call.from_user.id and not is_owner(call.from_user.id)):
+        await call.answer('Not authorized.', show_alert=True)
+        return
+    console_message = await call.message.answer(render_clone_console(row))
+    await start_console_watch(console_message.chat.id, console_message.message_id, clone_id, keep_seconds=900)
+    await call.answer('Live console opened. Refreshing every second.')
 
 
 @dp.callback_query(F.data.startswith(('start:', 'stop:', 'restart:')))
