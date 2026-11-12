@@ -592,6 +592,7 @@ class CentralAdminFlow(StatesGroup):
     premium_plan_bots = State()
     premium_plan_price = State()
     premium_plan_name = State()
+    owner_commands_input = State()
 
 
 def db():
@@ -679,6 +680,7 @@ def owner_kb():
         [InlineKeyboardButton(text='🤖 Manage All Bots', callback_data='allbots', style='success')],
         [InlineKeyboardButton(text='🎫 Support Tickets', callback_data='owner_tickets', style='primary')],
         [InlineKeyboardButton(text='💎 Manage Premium Plans', callback_data='owner_plans', style='success')],
+        [InlineKeyboardButton(text='⌨️ Manage Bot Commands', callback_data='owner_commands', style='primary')],
         [InlineKeyboardButton(text='⬅️ Back to Menu', callback_data='home', style='danger')],
     ])
 
@@ -877,7 +879,7 @@ async def launch_clone(row):
         update_status(row['id'], 'stopped', None)
         try:
             log_text = log_path.read_text(encoding='utf-8', errors='replace')
-            details = '\\n'.join(log_text.strip().splitlines()[-12:])
+            details = '\n'.join(log_text.strip().splitlines()[-12:])
         except OSError:
             details = ''
         reason = details[-1200:] if details else 'The cloned bot process exited during startup.'
@@ -1420,6 +1422,192 @@ async def user_ticket_reply_save(message: Message, state: FSMContext):
         c.execute('UPDATE platform_tickets SET updated_at=? WHERE id=?',(now,tid))
     await state.clear(); await message.answer(f'<b>Reply added to Ticket #{tid}.</b>',reply_markup=platform_support_kb(tid))
     await notify_owner(f'<b>💬 USER REPLIED · TICKET #{tid}</b>\nUser: <code>{message.from_user.id}</code>\n\n{escape(body)}')
+
+
+@dp.callback_query(F.data == 'owner_commands')
+async def owner_commands_list(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    with db() as c:
+        rows = c.execute('SELECT id,bot_name,bot_username,status FROM clones ORDER BY id DESC LIMIT 50').fetchall()
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{r['bot_name'] or 'Bot'} · @{r['bot_username'] or 'unknown'} · #{r['id']}",
+            callback_data=f"owner_commands_select:{r['id']}", style='primary')]
+        for r in rows
+    ]
+    buttons.append([InlineKeyboardButton(text='⬅️ Owner Panel', callback_data='owner_panel', style='danger')])
+    await call.message.edit_text('<b>⌨️ MANAGE BOT COMMANDS</b>\nSelect the cloned bot whose Telegram command menu you want to edit:', reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith('owner_commands_select:'))
+async def owner_commands_select(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    try:
+        clone_id = int(call.data.split(':', 1)[1])
+    except ValueError:
+        return await call.answer('Invalid bot.', show_alert=True)
+    row = get_clone(clone_id)
+    if not row:
+        return await call.answer('Bot not found.', show_alert=True)
+    tenant_db = Path(row['workdir']) / 'Cuibcc.db'
+    commands_text = 'No saved custom commands. Telegram defaults: /start and /admin.'
+    try:
+        with sqlite3.connect(tenant_db) as con:
+            found = con.execute("SELECT value FROM settings WHERE key='bot_commands_json'").fetchone()
+        if found and found[0]:
+            items = json.loads(found[0])
+            commands_text = '\n'.join(f"/{x.get('command','')} - {x.get('description','')}" for x in items)
+    except Exception as exc:
+        log.exception('Could not read commands for clone %s', clone_id)
+        commands_text = f'Could not read saved commands: {escape(str(exc)[:200])}'
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✏️ Edit Commands & Descriptions', callback_data=f'owner_commands_edit:{clone_id}', style='success')],
+        [InlineKeyboardButton(text='♻️ Reset to Defaults', callback_data=f'owner_commands_reset:{clone_id}', style='primary')],
+        [InlineKeyboardButton(text='⬅️ Bot List', callback_data='owner_commands', style='danger')],
+    ])
+    await call.message.edit_text(
+        f"<b>⌨️ BOT COMMANDS · #{clone_id}</b>\n"
+        f"Bot: <b>{escape(row['bot_name'] or 'Bot')}</b> (@{escape(row['bot_username'] or 'unknown')})\n\n"
+        f"<b>Current configuration:</b>\n<code>{escape(commands_text)}</code>\n\n"
+        'These commands are published to Telegram and refreshed when the bot starts or restarts.',
+        reply_markup=kb, parse_mode='HTML')
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith('owner_commands_edit:'))
+async def owner_commands_edit(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    try:
+        clone_id = int(call.data.split(':', 1)[1])
+    except ValueError:
+        return await call.answer('Invalid bot.', show_alert=True)
+    if not get_clone(clone_id):
+        return await call.answer('Bot not found.', show_alert=True)
+    await state.set_state(CentralAdminFlow.owner_commands_input)
+    await state.update_data(owner_commands_clone_id=clone_id)
+    await call.message.answer(
+        f'<b>EDIT COMMANDS · BOT #{clone_id}</b>\n\n'
+        'Send one command per line in this format:\n'
+        '<code>start - Start the bot</code>\n'
+        '<code>admin - Open admin panel</code>\n'
+        '<code>help - Get help</code>\n\n'
+        'You can edit both command name and description. Maximum 100 commands.\n'
+        'Send /cancel to cancel.', parse_mode='HTML')
+    await call.answer()
+
+
+@dp.message(CentralAdminFlow.owner_commands_input)
+async def owner_commands_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or '').strip().lower() == '/cancel':
+        data = await state.get_data()
+        clone_id = int(data.get('owner_commands_clone_id') or 0)
+        await state.clear()
+        return await message.answer('Command editing cancelled.', reply_markup=owner_kb())
+    data = await state.get_data()
+    clone_id = int(data.get('owner_commands_clone_id') or 0)
+    row = get_clone(clone_id)
+    if not row:
+        await state.clear()
+        return await message.answer('Bot not found. Please select it again.', reply_markup=owner_kb())
+    parsed, errors, seen = [], [], set()
+    for line_no, raw in enumerate((message.text or '').splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if ' - ' in line:
+            command, description = line.split(' - ', 1)
+        elif '=' in line:
+            command, description = line.split('=', 1)
+        else:
+            errors.append(f'Line {line_no}: use command - description')
+            continue
+        command = command.strip().lstrip('/').lower()
+        description = description.strip()
+        if not re.fullmatch(r'[a-z0-9_]{1,32}', command):
+            errors.append(f'Line {line_no}: invalid command name')
+        elif not description:
+            errors.append(f'Line {line_no}: description is empty')
+        elif len(description) > 256:
+            errors.append(f'Line {line_no}: description exceeds 256 characters')
+        elif command in seen:
+            errors.append(f'Line {line_no}: duplicate /{command}')
+        else:
+            seen.add(command)
+            parsed.append({'command': command, 'description': description})
+    if errors or not parsed or len(parsed) > 100:
+        reason = '\n'.join(errors[:8]) or ('Add at least one command.' if not parsed else 'Maximum 100 commands allowed.')
+        return await message.answer(f'<b>Could not save commands:</b>\n{escape(reason)}\n\nPlease send the list again.', parse_mode='HTML')
+    env_path = Path(row['workdir']) / '.env'
+    token = ''
+    try:
+        for line in env_path.read_text(encoding='utf-8').splitlines():
+            if line.startswith('BOT_TOKEN='):
+                token = line.split('=', 1)[1].strip()
+                break
+        if not token:
+            raise RuntimeError('Clone bot token is missing.')
+        clone_bot = Bot(token=token)
+        try:
+            await clone_bot.set_my_commands([BotCommand(command=x['command'], description=x['description']) for x in parsed])
+        finally:
+            await clone_bot.session.close()
+        tenant_db = Path(row['workdir']) / 'Cuibcc.db'
+        with sqlite3.connect(tenant_db) as con:
+            con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('bot_commands_json',?)", (json.dumps(parsed, ensure_ascii=False),))
+        await state.clear()
+        listing = '\n'.join(f"/{x['command']} - {x['description']}" for x in parsed)
+        await message.answer(f'<b>✅ Telegram commands updated for bot #{clone_id}.</b>\n\n<code>{escape(listing)}</code>', reply_markup=owner_kb(), parse_mode='HTML')
+    except Exception as exc:
+        log.exception('Could not save owner-configured commands for clone %s', clone_id)
+        await message.answer(f'❌ Could not update Telegram commands: <code>{escape(str(exc)[:400])}</code>', parse_mode='HTML')
+
+
+@dp.callback_query(F.data.startswith('owner_commands_reset:'))
+async def owner_commands_reset(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer('Owner only.', show_alert=True)
+    try:
+        clone_id = int(call.data.split(':', 1)[1])
+    except ValueError:
+        return await call.answer('Invalid bot.', show_alert=True)
+    row = get_clone(clone_id)
+    if not row:
+        return await call.answer('Bot not found.', show_alert=True)
+    token = ''
+    try:
+        for line in (Path(row['workdir']) / '.env').read_text(encoding='utf-8').splitlines():
+            if line.startswith('BOT_TOKEN='):
+                token = line.split('=', 1)[1].strip()
+                break
+        if not token:
+            raise RuntimeError('Clone bot token is missing.')
+        clone_bot = Bot(token=token)
+        defaults = [BotCommand(command='start', description='Start the bot'), BotCommand(command='admin', description='Open admin panel')]
+        try:
+            await clone_bot.set_my_commands(defaults)
+        finally:
+            await clone_bot.session.close()
+        with sqlite3.connect(Path(row['workdir']) / 'Cuibcc.db') as con:
+            con.execute("DELETE FROM settings WHERE key='bot_commands_json'")
+        await call.answer('Default commands restored.', show_alert=True)
+        await call.message.edit_text(
+            f'<b>⌨️ BOT COMMANDS · #{clone_id}</b>\n\n'
+            '<b>Default commands restored:</b>\n'
+            '<code>/start - Start the bot\n/admin - Open admin panel</code>',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='✏️ Edit Commands & Descriptions', callback_data=f'owner_commands_edit:{clone_id}', style='success')],
+                [InlineKeyboardButton(text='⬅️ Bot List', callback_data='owner_commands', style='danger')],
+            ]), parse_mode='HTML')
+    except Exception as exc:
+        log.exception('Could not reset commands for clone %s', clone_id)
+        await call.answer(f'Could not reset: {str(exc)[:150]}', show_alert=True)
 
 
 @dp.callback_query(F.data == 'owner_tickets')
