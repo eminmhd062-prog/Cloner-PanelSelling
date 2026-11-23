@@ -1226,7 +1226,75 @@ async def start_console_watch(chat_id, message_id, clone_id, keep_seconds=900):
     return task
 
 
+def _upgrade_existing_clone_template(row):
+    """Upgrade legacy clones created before the Premium Emoji system existed.
+
+    Only replaces main.py when it looks like this hoster's built-in shop template.
+    Keeps each clone's database and uploaded companion files intact, and backs up
+    the old main.py before replacing it.
+    """
+    workdir = Path(row["workdir"])
+    main_path = workdir / "main.py"
+    env_path = workdir / ".env"
+    if not main_path.is_file() or not env_path.is_file():
+        return False
+
+    try:
+        current_source = main_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    if "GLOBAL PREMIUM EMOJI SYSTEM" in current_source:
+        return False
+
+    # Avoid overwriting arbitrary user-uploaded Python projects. These markers
+    # identify the built-in Panel Store template shipped in the original Cl1.zip.
+    signatures = (
+        "FAMPAY_VERIFY_URL",
+        "USDT_TO_INR = 90.0",
+        "def admin_kb",
+        "CREATE TABLE IF NOT EXISTS products",
+    )
+    if sum(marker in current_source for marker in signatures) < 3:
+        log.warning("Skip emoji template upgrade for clone %s: main.py is not a recognized legacy shop template", row["id"])
+        return False
+
+    env_values = {}
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env_values[key.strip()] = value.strip()
+    except OSError:
+        return False
+
+    token = env_values.get("BOT_TOKEN", "")
+    if not token:
+        log.warning("Skip emoji template upgrade for clone %s: BOT_TOKEN missing from .env", row["id"])
+        return False
+
+    backup_path = workdir / "main.py.before_premium_emoji_upgrade.bak"
+    try:
+        if not backup_path.exists():
+            shutil.copy2(main_path, backup_path)
+        template = load_template()
+        prepare_clone(
+            template=template,
+            workdir=workdir,
+            token=token,
+            owner_id=int(row["owner_id"]),
+            bot_name=row["bot_name"] or "My Panel Store",
+            bot_username=(row["bot_username"] or "").lstrip("@"),
+        )
+        log.info("Upgraded legacy clone %s with Premium Emoji support; backup=%s", row["id"], backup_path)
+        return True
+    except Exception:
+        log.exception("Could not upgrade legacy clone %s with Premium Emoji support", row["id"])
+        return False
+
+
 async def launch_clone(row):
+    _upgrade_existing_clone_template(row)
     _platform_sync_all_emojis_to_clone_database(row)
     workdir = Path(row['workdir'])
     env_path = workdir / '.env'
