@@ -41,7 +41,7 @@ for p in (DATA, CLONES, UPLOADS):
 # Set BOT_TOKEN to a newly generated token (old token was exposed).
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9292314438:AAFkoqk6k6S-RZAOpOOgJZxpgJzCKeTS3xs")
 # Put your Telegram numeric user ID here (not your username).
-OWNER_ID = 8385172584
+OWNER_ID = 123456789  # Replace with your Telegram numeric Admin ID
 # ===============================================================
 
 # The original Panel Selling Bot template is embedded in this file,
@@ -534,8 +534,8 @@ LOG = BASE / 'manager.log'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', handlers=[logging.FileHandler(LOG), logging.StreamHandler()])
 log = logging.getLogger('clone-manager')
 
-if not BOT_TOKEN or BOT_TOKEN == 'PASTE_YOUR_NEW_CLONING_BOT_TOKEN_HERE' or OWNER_ID <= 0 :
-    raise SystemExit('Set a NEW BOT_TOKEN (the previously exposed token must be revoked) and OWNER_ID in the configuration section or environment.')
+if not BOT_TOKEN or BOT_TOKEN == 'PASTE_BOT_TOKEN_HERE' or OWNER_ID <= 0 :
+    raise SystemExit('Set BOT_TOKEN and OWNER_ID directly in the configuration section.')
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp = Dispatcher()
@@ -567,14 +567,14 @@ def _platform_apply_custom_emojis(value):
 
 
 def _platform_apply_button_icons(markup):
+    """Use the assigned Premium Emoji as the button icon, not beside its old emoji."""
     if markup is None:
         return markup
     mapping = _platform_emoji_mapping()
     if not mapping:
         return markup
     fields = getattr(_InlineKeyboardButton, 'model_fields', {}) or getattr(_InlineKeyboardButton, '__fields__', {})
-    if 'icon_custom_emoji_id' not in fields:
-        return markup
+    supports_custom_icon = 'icon_custom_emoji_id' in fields
     rows = getattr(markup, 'inline_keyboard', None)
     if rows:
         for row in rows:
@@ -582,7 +582,13 @@ def _platform_apply_button_icons(markup):
                 label = getattr(button, 'text', '') or ''
                 for fallback, custom_id in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
                     if fallback and custom_id and fallback in label:
-                        button.icon_custom_emoji_id = str(custom_id)
+                        if supports_custom_icon:
+                            button.icon_custom_emoji_id = str(custom_id)
+                        # Remove the original Unicode emoji from the label. The
+                        # Premium custom emoji is rendered in the button's icon slot.
+                        label = label.replace(fallback, '', 1)
+                        label = re.sub(r'^[\s·|—–-]+|[\s·|—–-]+$', '', label)
+                        button.text = label if label else '\u2063'
                         break
     return markup
 
