@@ -39,7 +39,7 @@ for p in (DATA, CLONES, UPLOADS):
 
 # ===================== OWNER CONFIGURATION =====================
 # Set BOT_TOKEN to a newly generated token (old token was exposed).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9292314438:AAFkoqk6k6S-RZAOpOOgJZxpgJzCKeTS3xs")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9292314438:AAGuWoNrtUCsl68lYzRNpph1PnoXK6KTeAA")
 # Put your Telegram numeric user ID here (not your username).
 OWNER_ID = 8385172584  # Replace with your Telegram numeric Admin ID
 # ===============================================================
