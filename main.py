@@ -726,56 +726,7 @@ def db():
     return con
 
 
-PLATFORM_EMOJI_INVENTORY_SEED = [
-    ('⬅️', 22),
-    ('✅', 15),
-    ('🎫', 9),
-    ('🤖', 8),
-    ('❌', 7),
-    ('💬', 7),
-    ('💎', 6),
-    ('🔴', 6),
-    ('🟢', 6),
-    ('⌨️', 4),
-    ('✏️', 4),
-    ('📊', 4),
-    ('📢', 4),
-    ('📤', 4),
-    ('📦', 4),
-    ('⚙️', 3),
-    ('➕', 3),
-    ('👑', 3),
-    ('📂', 3),
-    ('🖥', 3),
-    ('♻️', 2),
-    ('✨', 2),
-    ('🌈', 2),
-    ('📋', 2),
-    ('📝', 2),
-    ('🔒', 2),
-    ('🗑', 2),
-    ('🧾', 2),
-    ('ℹ️', 1),
-    ('⏹', 1),
-    ('▶️', 1),
-    ('⚠️', 1),
-    ('⚡', 1),
-    ('➖', 1),
-    ('➡️', 1),
-    ('🆕', 1),
-    ('🎉', 1),
-    ('🎧', 1),
-    ('👁', 1),
-    ('👤', 1),
-    ('👥', 1),
-    ('💰', 1),
-    ('📌', 1),
-    ('📥', 1),
-    ('📩', 1),
-    ('🔄', 1),
-    ('🔐', 1),
-    ('🔢', 1),
-]
+PLATFORM_EMOJI_INVENTORY_SEED = [('⬅️', 33), ('✅', 68), ('🎫', 11), ('🤖', 8), ('❌', 58), ('💬', 11), ('💎', 10), ('🔴', 20), ('🟢', 20), ('⌨️', 6), ('✏️', 15), ('📊', 11), ('📢', 6), ('📤', 4), ('📦', 18), ('⚙️', 4), ('➕', 9), ('👑', 12), ('📂', 4), ('🖥', 3), ('♻️', 4), ('✨', 5), ('🌈', 4), ('📋', 10), ('📝', 6), ('🔒', 4), ('🗑', 7), ('🧾', 11), ('ℹ️', 2), ('⏹', 1), ('▶️', 1), ('⚠️', 21), ('⚡', 9), ('➖', 3), ('➡️', 2), ('🆕', 1), ('🎉', 10), ('🎧', 1), ('👁', 2), ('👤', 16), ('👥', 6), ('💰', 25), ('📌', 1), ('📥', 3), ('📩', 1), ('🔄', 4), ('🔐', 1), ('🔢', 1), ('💳', 12), ('📅', 11), ('🔑', 11), ('🌟', 8), ('💵', 8), ('⏳', 7), ('✈️', 7), ('🛠️', 7), ('🆔', 6), ('🎡', 6), ('📱', 6), ('🔵', 6), ('🟡', 6), ('🟣', 6), ('🪙', 6), ('🎁', 5), ('👇', 5), ('🛍️', 5), ('🎨', 4), ('💸', 4), ('1️⃣', 3), ('2️⃣', 3), ('🎟', 3), ('🎟️', 3), ('🏦', 3), ('🏷️', 3), ('📁', 3), ('🔗', 3), ('🚫', 3), ('🛒', 3), ('🪪', 3), ('3️⃣', 2), ('4️⃣', 2), ('☎️', 2), ('✔️', 2), ('🏢', 2), ('👋', 2), ('👛', 2), ('💻', 2), ('📘', 2), ('🖼', 2), ('🗑️', 2), ('🛡', 2), ('↩️', 1), ('⏱', 1), ('☑️', 1), ('☢️', 1), ('✍️', 1), ('❓', 1), ('🌐', 1), ('🏅', 1), ('🏷', 1), ('👁\u200d🗨', 1), ('📛', 1), ('📜', 1), ('📞', 1), ('📭', 1), ('📹', 1), ('🔓', 1), ('🔖', 1), ('🔧', 1), ('🔰', 1), ('🖼️', 1), ('🙂', 1), ('🚨', 1), ('🛡️', 1), ('🥇', 1), ('🧰', 1)]
 
 
 PLATFORM_EMOJI_PAGE_SIZE = 12
@@ -799,6 +750,79 @@ def _platform_emoji_settings():
     finally:
         if con is not None:
             con.close()
+
+def _platform_sync_emoji_to_clone_databases(original, record=None):
+    """Copy the central emoji mapping into every cloned shop's own settings DB.
+
+    The embedded shop template reads global_emoji_<hash> from its tenant DB,
+    not platform_global_emoji_<hash> from the manager DB. Keeping both copies
+    in sync is what makes the change visible in customer-facing bot processes.
+    """
+    tenant_key = "global_emoji_" + hashlib.sha1(original.encode("utf-8")).hexdigest()[:16]
+    with db() as c:
+        clones = c.execute("SELECT id, workdir FROM clones").fetchall()
+    synced = 0
+    for clone in clones:
+        tenant_db = Path(clone["workdir"]) / "Cuibcc.db"
+        try:
+            tenant_db.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(tenant_db) as con:
+                con.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                if record is None:
+                    con.execute("DELETE FROM settings WHERE key=?", (tenant_key,))
+                else:
+                    con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                                (tenant_key, json.dumps(record, ensure_ascii=False)))
+            synced += 1
+        except Exception:
+            log.exception("Could not sync global emoji setting to clone %s", clone["id"])
+    return synced
+
+
+def _platform_sync_all_emojis_to_clone_database(row):
+    """Seed saved platform emoji mappings into a clone before its process starts."""
+    tenant_db = Path(row["workdir"]) / "Cuibcc.db"
+    records = _platform_emoji_settings()
+    with sqlite3.connect(tenant_db) as con:
+        con.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for original, _count in _platform_emoji_inventory():
+            record = records.get(_platform_emoji_key(original))
+            if isinstance(record, dict) and str(record.get("id", "")).isdigit():
+                tenant_key = "global_emoji_" + hashlib.sha1(original.encode("utf-8")).hexdigest()[:16]
+                con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                            (tenant_key, json.dumps(record, ensure_ascii=False)))
+
+
+async def _platform_restart_running_clones_for_emoji_change():
+    """Restart active clone processes so their cached emoji settings reload."""
+    with db() as c:
+        rows = c.execute("SELECT * FROM clones").fetchall()
+    restarted = 0
+    failed = 0
+    for old_row in rows:
+        pid = old_row["pid"]
+        if not process_alive(pid):
+            continue
+        try:
+            await stop_clone(old_row)
+            for _ in range(24):
+                if not process_alive(pid):
+                    break
+                await asyncio.sleep(0.25)
+            if process_alive(pid):
+                try:
+                    os.kill(int(pid), 9)
+                except OSError:
+                    pass
+            fresh = get_clone(old_row["id"])
+            _platform_sync_all_emojis_to_clone_database(fresh)
+            await launch_clone(fresh)
+            restarted += 1
+        except Exception:
+            failed += 1
+            log.exception("Could not restart clone %s after global emoji update", old_row["id"])
+    return restarted, failed
+
 
 def _platform_apply_custom_emojis(value):
     if not isinstance(value, str) or not value:
@@ -1203,6 +1227,7 @@ async def start_console_watch(chat_id, message_id, clone_id, keep_seconds=900):
 
 
 async def launch_clone(row):
+    _platform_sync_all_emojis_to_clone_database(row)
     workdir = Path(row['workdir'])
     env_path = workdir / '.env'
     values = {}
@@ -1692,7 +1717,14 @@ async def owner_emoji_reset(call: CallbackQuery):
         return await call.answer("Emoji not found.", show_alert=True)
     with db() as c:
         c.execute("DELETE FROM settings WHERE key=?", (_platform_emoji_key(emoji),))
-    await call.answer("Emoji reset to original.", show_alert=True)
+    synced = _platform_sync_emoji_to_clone_databases(emoji, None)
+    await call.answer("Emoji reset. Refreshing cloned bots...", show_alert=True)
+    restarted, failed = await _platform_restart_running_clones_for_emoji_change()
+    await call.message.answer(
+        f"<b>Emoji reset completed.</b>\nClone databases synced: {synced}\n"
+        f"Running clones restarted: {restarted}\nRestart errors: {failed}",
+        parse_mode="HTML"
+    )
     await _show_platform_emoji_manager(call.message, 0)
 
 @dp.message(Flow.waiting_global_emoji)
@@ -1711,16 +1743,23 @@ async def save_platform_global_emoji(message: Message, state: FSMContext):
     fallback = _platform_utf16_slice(message.text, entity.offset, entity.length)
     if not custom_id.isdigit() or not fallback:
         return await message.answer("❌ Invalid Premium Emoji. Please send it again.")
+    record = {"id": custom_id, "fallback": fallback}
     with db() as c:
         c.execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
-            (_platform_emoji_key(original), json.dumps({"id": custom_id, "fallback": fallback}, ensure_ascii=False))
+            (_platform_emoji_key(original), json.dumps(record, ensure_ascii=False))
         )
+    synced = _platform_sync_emoji_to_clone_databases(original, record)
+    await message.answer("<b>Premium Emoji saved. Updating active cloned bots...</b>")
+    restarted, failed = await _platform_restart_running_clones_for_emoji_change()
     await state.clear()
     await message.answer(
-        f"✅ Global emoji updated!\n\n<b>Original:</b> {original}\n"
-        f"<b>New:</b> <tg-emoji emoji-id=\"{custom_id}\">{fallback}</tg-emoji>\n"
-        "Matching emojis in this cloning bot's messages and button icons are now updated.",
+        f"✅ <b>Global emoji updated!</b>\n\n<b>Original:</b> {original}\n"
+        f"<b>New:</b> <tg-emoji emoji-id=\"{custom_id}\">{fallback}</tg-emoji>\n\n"
+        f"<b>Clone databases synced:</b> {synced}\n"
+        f"<b>Running clones restarted:</b> {restarted}\n"
+        f"<b>Restart errors:</b> {failed}\n\n"
+        "The matching emoji is now mapped in cloned bot messages and button icons.",
         parse_mode="HTML", reply_markup=owner_kb()
     )
 
