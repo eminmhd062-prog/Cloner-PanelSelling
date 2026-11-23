@@ -11,7 +11,10 @@ import logging
 from html import escape
 import os
 import re
-import regex as _emoji_regex
+try:
+    import regex as _emoji_regex
+except ImportError:
+    _emoji_regex = None
 import shutil
 import sqlite3
 import sys
@@ -1401,11 +1404,59 @@ def _platform_emoji_source_text():
 
 def _platform_emoji_catalog():
     source = _platform_emoji_source_text()
-    clusters = _emoji_regex.findall(r'\X', source)
     counts = {}
-    for cluster in clusters:
-        if _emoji_regex.search(r'\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Regional_Indicator}', cluster):
-            counts[cluster] = counts.get(cluster, 0) + 1
+
+    if _emoji_regex is not None:
+        clusters = _emoji_regex.findall(r'\X', source)
+        for cluster in clusters:
+            if _emoji_regex.search(
+                r'\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Regional_Indicator}',
+                cluster
+            ):
+                counts[cluster] = counts.get(cluster, 0) + 1
+    else:
+        # Standard-library fallback: avoid crashing if the host has not installed
+        # the optional 'regex' wheel. Keep variation selectors, skin tones,
+        # regional-indicator pairs and ZWJ sequences together.
+        import unicodedata
+        clusters = []
+        current = ""
+        join_next = False
+        regional_count = 0
+        for char in source:
+            cp = ord(char)
+            is_modifier = 0x1F3FB <= cp <= 0x1F3FF
+            is_variation = cp in (0xFE0E, 0xFE0F)
+            is_regional = 0x1F1E6 <= cp <= 0x1F1FF
+            is_joiner = cp == 0x200D
+            is_mark = unicodedata.category(char).startswith("M")
+            if not current:
+                current = char
+                regional_count = 1 if is_regional else 0
+            elif is_mark or is_modifier or is_variation or join_next or is_joiner:
+                current += char
+                if is_regional:
+                    regional_count += 1
+            elif is_regional and regional_count == 1:
+                current += char
+                regional_count = 2
+            else:
+                clusters.append(current)
+                current = char
+                regional_count = 1 if is_regional else 0
+            join_next = is_joiner
+        if current:
+            clusters.append(current)
+
+        for cluster in clusters:
+            if any(
+                0x1F000 <= ord(ch) <= 0x1FAFF
+                or 0x2600 <= ord(ch) <= 0x27BF
+                or 0x1F1E6 <= ord(ch) <= 0x1F1FF
+                for ch in cluster
+            ):
+                counts[cluster] = counts.get(cluster, 0) + 1
+
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
 
