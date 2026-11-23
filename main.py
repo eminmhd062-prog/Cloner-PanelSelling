@@ -41,7 +41,7 @@ for p in (DATA, CLONES, UPLOADS):
 # Set BOT_TOKEN to a newly generated token (old token was exposed).
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9292314438:AAFkoqk6k6S-RZAOpOOgJZxpgJzCKeTS3xs")
 # Put your Telegram numeric user ID here (not your username).
-OWNER_ID = 123456789  # Replace with your Telegram numeric Admin ID
+OWNER_ID = 8385172584  # Replace with your Telegram numeric Admin ID
 # ===============================================================
 
 # The original Panel Selling Bot template is embedded in this file,
